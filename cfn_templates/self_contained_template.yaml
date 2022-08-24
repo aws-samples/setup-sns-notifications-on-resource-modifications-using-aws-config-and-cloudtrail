@@ -1,0 +1,521 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: '**WARNING** This template creates EventBridge Rule, SQS Queues, Lambda
+  Function, SNS Topic, KMS CMK, and related resources. You will be billed for the AWS resources
+  used if you create a stack from this template.'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuration Items Capture Scope
+        Parameters:
+          - ResourceTypesToBeCapturedByCWERule
+          - CIStatusToBeCapturedByCWERule
+      - Label:
+          default: AWS Lambda Configuration
+        Parameters:
+          - LambdaReservedConcurrentExecutions
+    ParameterLabels:
+      ResourceTypesToBeCapturedByCWERule:
+        default: Resource types to be captured by EventBridge event rule
+      CIStatusToBeCapturedByCWERule:
+        default: Configuration items status to be captured by EventBridge event rule
+      LambdaReservedConcurrentExecutions:
+        default: Lambda function reserved concurrent executions
+Parameters:
+  ResourceTypesToBeCapturedByCWERule:
+    Type: CommaDelimitedList
+    Description: The string list of resource types to be captured by the solution,
+      for example "AWS::S3::Bucket, AWS::EC2::Instance" (without quotation). If no
+      value is provided, default is the resources type(s) your ConfigurationRecorder
+      is currently capturing.
+    Default: <use default setting>
+  CIStatusToBeCapturedByCWERule:
+    Type: String
+    Description: The string list of configuration item status to be captured by the
+      solution. Default is to capture resource discovery, mutation, and deletion.
+    Default: AllStatuses
+    AllowedValues:
+      - AllStatuses
+      - OnlyResourceDiscoveredAndResourceDeleted
+      - OnlyResourceDiscovered
+      - OnlyResourceDeleted
+  LambdaReservedConcurrentExecutions:
+    Type: String
+    Description: The number of simultaneous executions to reserve for the events lookup
+      Lambda function. Leave blank to use the default value.
+    Default: <use default setting>
+Conditions:
+  NotResourceTypesToBeCapturedByCWERule: !Equals
+    - Fn::Join:
+        - ''
+        - !Ref 'ResourceTypesToBeCapturedByCWERule'
+    - <use default setting>
+  HasLambdaReservedConcurrentExecutions: !Equals
+    - !Ref 'LambdaReservedConcurrentExecutions'
+    - <use default setting>
+Mappings:
+  Settings:
+    CIStatus:
+      AllStatuses:
+        - ResourceDiscovered
+        - OK
+        - ResourceDeleted
+      OnlyResourceDiscoveredAndResourceDeleted:
+        - ResourceDiscovered
+        - ResourceDeleted
+      OnlyResourceDiscovered:
+        - ResourceDiscovered
+      OnlyResourceDeleted:
+        - ResourceDeleted
+Resources:
+  LookupCIEventsLambdaFunction:
+    DependsOn:
+      - LookupCIEventsLambdaFunctionLogGroup
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W58
+          reason: 'Permission for lambda to write CW Logs is already given in the Lambda execution role "LookupCIEventsLambdaFunctionExecutionRole"'
+        - id: W89
+          reason: 'Deployed outside of VPC to minimize overhead and reduce exposure as it parses CloudTrail events'
+    Properties:
+      FunctionName: LookupCIEventsLambdaFunctionName
+      Environment:
+        Variables:
+          SNSTopicARN: !Ref 'LookupCIEventsSNSTopic'
+      Code:
+        ZipFile: |
+          import boto3
+          import sys
+          import time
+          import datetime as dt
+          import json
+          import os
+          import urllib.parse
+
+          def lambda_handler(event, context):
+              try:
+                  event = json.loads(event["Records"][0]["body"])["detail"]
+
+                  if event["messageType"] == "ConfigurationItemChangeNotification":
+                      CI = event["configurationItem"]
+                  elif event["messageType"] == "OversizedConfigurationItemChangeNotification":
+                      CI = event["configurationItemSummary"]
+                  else:
+                      print ("Notification messageType is neither CI change nor oversized CI change.")
+                      sys.exit()
+
+                  # Fetch Resource Type.
+                  # Terminate if ResourceType is in ignored resource type list.
+                  resourceType = CI["resourceType"]
+                  ignored_resource_type = ["AWS::Config::ResourceCompliance","AWS::Config::ConformancePackCompliance"]
+                  if resourceType in ignored_resource_type:
+                      print ("Resource Type"+resourceType+"included in discarded list - terminate")
+                      sys.exit()
+                  else:
+                      pass
+
+                  ItemCaptureTime = CI["configurationItemCaptureTime"]
+                  resourceARN = CI["ARN"]
+                  resourceId = CI["resourceId"]
+                  configurationItemStatus = CI["configurationItemStatus"]
+
+                  # Logic to fetch ResourceName or ResourceID.
+                  # Depending on the resource type, some CIs do not have a resourceName, but all CIs have at least a resourceId.
+                  if CI.get("resourceName") != None:
+                      resourceName = CI["resourceName"]
+                  elif CI.get("resourceName") == None:
+                      resourceName = CI["resourceId"]
+                  else:
+                      print ("Not able to fetch resource name or ID - terminate")
+                      sys.exit()
+
+                 # Fetch time window for Lookup.
+                  lookup_time = establish_time(ItemCaptureTime)
+                  start_lookup_time = (lookup_time[0])
+                  end_lookup_time = (lookup_time[1])
+
+                  CT_lookup(resourceName,resourceId,resourceType,resourceARN,start_lookup_time,end_lookup_time,configurationItemStatus)
+
+              except Exception as error:
+                  print (str(error))
+
+          def establish_time(ItemCaptureTime):
+              try:
+                  # Establish time window for the lookup in CTrail. CI capture is best effort after resource configuration change event, but generally in 15 mins
+                  startime = (dt.datetime.strptime(ItemCaptureTime, '%Y-%m-%dT%H:%M:%S.%fZ'))
+                  startime = (startime - dt.timedelta(seconds=900))
+                  startime = dt.datetime.strftime(startime, '%Y-%m-%dT%H:%M:%S.%fZ')
+                  endtime = ItemCaptureTime
+                  return startime, endtime
+              except Exception as error:
+                  print (str(error))
+
+          def CT_lookup(resourceName,resourceId,resourceType,resourceARN,start_lookup_time,end_lookup_time,configurationItemStatus):
+              try:
+                  # Global resources such as IAM resource types can only be lookup in CloudTrail us-east-1 region, even though Config Recorder in other region is recording them.
+                  if "AWS::IAM::" in resourceType:
+                      client = boto3.client('cloudtrail', region_name="us-east-1")
+                  else:
+                      client = boto3.client('cloudtrail')
+
+                  # Perform lookups via ResourceName, which the value is from the resourceName/Id in the CI. Allowed only 2 loops max.
+                  # Lookup by resourceType would not be helpful due to high chance of false hit. It is also redundant to verify the resourceName if lookup event by resourceType.
+                  no_events = True
+                  max_loops = 0
+                  while no_events == True:
+                      if max_loops == 2:
+                          print ("DONE - Lookup loops x"+max_loops)
+                          break
+                      else:
+                          if max_loops == 0:
+                              attribute_key = "ResourceName"
+                              attribute_value = resourceName
+                          elif max_loops == 1:
+                              attribute_key = "ResourceName"
+                              attribute_value = resourceId
+                          else:
+                              break
+                          max_loops = max_loops+1
+                          paginator = client.get_paginator('lookup_events')
+                          response_iterator = paginator.paginate(LookupAttributes=[{
+                              'AttributeKey': attribute_key,
+                              'AttributeValue': attribute_value},],
+                              StartTime=start_lookup_time,
+                              EndTime=end_lookup_time)
+                          for value in response_iterator:
+                              if (len(value["Events"])) == 0 and max_loops ==1 and resourceId != resourceName:
+                                  print ("No events for ResourceName:"+resourceName+"- trying resourceId lookup")
+                              else:
+                                  no_events = False
+                                  handle_event(value,resourceName,resourceId,resourceType,resourceARN,end_lookup_time,configurationItemStatus)
+              except Exception as error:
+                  print (str(error))
+
+          def handle_event(value,resourceName,resourceId,resourceType,resourceARN,end_lookup_time,configurationItemStatus):
+              try:
+                  # Handle Lookup results.
+                  # Logic to ignore read events, error events, or no resources.
+                  # Check ResourceType and ResourceName matches CI event values.
+                  sns_check_bool = False
+                  events = (value["Events"])
+
+                  lambda_runtime_region = os.environ['AWS_REGION']
+                  config_console_link = 'https://'\
+                                        +lambda_runtime_region\
+                                        +'.console.aws.amazon.com/config/home?region='\
+                                        +lambda_runtime_region\
+                                        +'#/resources/timeline?resourceId='\
+                                        +urllib.parse.quote_plus(resourceId)\
+                                        +'&resourceType='\
+                                        +urllib.parse.quote_plus(resourceType)
+
+                  for event in events:
+                      CloudTrailEvent = event["CloudTrailEvent"]
+                      CloudTrailEvent = json.loads(CloudTrailEvent)
+                      if (event["ReadOnly"]) == "true":
+                          print ("Read event - Ignored")
+                      elif "errorCode" in CloudTrailEvent or "errorMessage" in CloudTrailEvent:
+                          print ("Event related to erroneous call - Ignored")
+                      elif (len(event["Resources"])) == 0:
+                          print ("No resource values found - Ignored")
+                      else:
+                          for resourcevalues in (event["Resources"]):
+                              # this is to filter resource that share the same resourceName/resourceId but is actually a different resource type.
+                              if (resourcevalues["ResourceType"]) == resourceType and ((resourcevalues["ResourceName"]) == resourceName or (resourcevalues["ResourceName"]) == resourceId):
+                                  # "Root","IAMUser","AssumedRole" has userIdentity.arn in the CloudTrail event, but others do not. 
+                                  if CloudTrailEvent["userIdentity"]["type"] in ["Root","IAMUser","AssumedRole"]:
+                                      userIdentity = (CloudTrailEvent["userIdentity"]["arn"])
+                                  else:
+                                      userIdentity = "\n"+str(json.dumps(CloudTrailEvent["userIdentity"], indent=2))
+                                  EventName = (event["EventName"])
+                                  EventId = (event["EventId"])
+                                  EventTime = (event["EventTime"])
+
+                                  # Send SNS notification if CT events were found
+                                  ctrail_console_link = 'https://'+lambda_runtime_region+'.console.aws.amazon.com/cloudtrail/home?region='+lambda_runtime_region+'#/events/'+EventId
+                                  message = str("Event details logged in CloudTrail within 15 minutes before CI capture:"\
+                                                +"\n\nConfiguration Item status: "\
+                                                +configurationItemStatus\
+                                                +"\nConfiguration Item capture time: "\
+                                                +end_lookup_time\
+                                                +"\nResource ID: "\
+                                                +resourceId\
+                                                +"\nResource ARN: "\
+                                                +resourceARN\
+                                                +"\nResource Type: "\
+                                                +resourceType\
+                                                +"\n\nEvent ID: "\
+                                                +EventId\
+                                                +"\nEvent Time: "\
+                                                +str(EventTime)\
+                                                +"\nEvent Name: "\
+                                                +EventName\
+                                                +"\nUser Identity: "\
+                                                +userIdentity\
+                                                +"\n\nCloudTrail Event History console link:\n"\
+                                                +ctrail_console_link\
+                                                +"\n\nConfig Resources console link:\n"\
+                                                +config_console_link)
+                                  subject = "Config Configuration Item change detected"
+                                  sns_notification(message,subject)
+                                  print ("SNS notification sent - Events obtained from CloudTrail")
+                                  sns_check_bool = True
+                                  break
+                              else:
+                                  print ("ResourceType and ResourceName/Id do not match.")
+
+                  # Conditional statement to check if previous SNS notification was sent.
+                  # Bool var "sns_check_bool" used for check.
+                  # if False, send notification that no events were found.
+                  if sns_check_bool == False:
+                      message = str("Script could not find any CloudTrail events within 15 minutes before CI capture for below resources. Check the Config Resources console link for more info."\
+                                    +"\n\nConfiguration Item status: "\
+                                    +configurationItemStatus\
+                                    +"\nConfiguration Item capture time: "\
+                                    +end_lookup_time\
+                                    +"\nResource ID: "\
+                                    +resourceId\
+                                    +"\nResource ARN: "\
+                                    +resourceARN\
+                                    +"\nResource Type: "\
+                                    +resourceType\
+                                    +"\n\nConfig Resources console link:\n"\
+                                    +config_console_link)
+                      subject = "Config Configuration Item change detected"
+                      sns_notification(message,subject)
+                      print ("SNS notification sent - Events could not be obtained from CloudTrail for",resourceId,"//",resourceType)
+                  else:
+                      pass
+              except Exception as error:
+                  print (str(error))
+
+          def sns_notification(message,subject):
+              try:
+                  # Send SNS notifications
+                  topic = os.environ['SNSTopicARN']
+                  sns = boto3.client('sns')
+                  response_SNS = sns.publish(TopicArn=topic,Message=message,Subject=subject)
+              except Exception as error:
+                  print (str(error))
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt 'LookupCIEventsLambdaFunctionExecutionRole.Arn'
+      Timeout: 30
+      ReservedConcurrentExecutions: !If
+        - HasLambdaReservedConcurrentExecutions
+        - !Ref 'AWS::NoValue'
+        - !Ref 'LambdaReservedConcurrentExecutions'
+  LookupCIEventsLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/LookupCIEventsLambdaFunctionName
+      KmsKeyId: !GetAtt 'LookupCIEventsKMSCMK.Arn'
+      RetentionInDays: 7
+  LookupCIEventsLambdaFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: '"cloudtrail:LookupEvents" action does not support resource-based policy and must use resource "*"'
+    Properties:
+      Description: Lookup-CI-Events-Lambda-Function-Execution-Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/LookupCIEventsLambdaFunctionName:*'
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref 'LookupCIEventsSNSTopic'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt 'LookupCIEventsSQSQueue.Arn'
+                  - !GetAtt 'LookupCIEventsSQSQueueDLQ.Arn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt 'LookupCIEventsKMSCMK.Arn'
+  LookupCIEventsLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      EventSourceArn: !GetAtt 'LookupCIEventsSQSQueue.Arn'
+      FunctionName: !GetAtt 'LookupCIEventsLambdaFunction.Arn'
+  LookupCIEventsLambdaFunctionEventSourceMappingDLQ:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      EventSourceArn: !GetAtt 'LookupCIEventsSQSQueueDLQ.Arn'
+      FunctionName: !GetAtt 'LookupCIEventsLambdaFunction.Arn'
+  LookupCIEventsCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch Event Rule that captures Configuration Change Items
+        and send to SQS.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Configuration Item Change
+        detail:
+          configurationItem:
+            resourceType: !If
+              - NotResourceTypesToBeCapturedByCWERule
+              - - anything-but:
+                    - AWS::Config::ResourceCompliance
+                    - AWS::SSM::AssociationCompliance
+                    - AWS::Config::ConformancePackCompliance
+              - !Ref 'ResourceTypesToBeCapturedByCWERule'
+            configurationItemStatus: !FindInMap
+              - Settings
+              - CIStatus
+              - !Ref 'CIStatusToBeCapturedByCWERule'
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt 'LookupCIEventsSQSQueue.Arn'
+          Id: LookupCIEventsSQSQueue
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 400
+  LookupCIEventsCloudWatchEventRuleOversized:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch Event Rule that captures Configuration Change Items
+        and send to SQS.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Configuration Item Change
+        detail:
+          configurationItemSummary:
+            resourceType: !If
+              - NotResourceTypesToBeCapturedByCWERule
+              # These resource types never has a CloudTrail event. Thus excluding them in the event rule.
+              - - anything-but:
+                    - AWS::Config::ResourceCompliance
+                    - AWS::SSM::AssociationCompliance
+                    - AWS::Config::ConformancePackCompliance
+              - !Ref 'ResourceTypesToBeCapturedByCWERule'
+            configurationItemStatus: !FindInMap
+              - Settings
+              - CIStatus
+              - !Ref 'CIStatusToBeCapturedByCWERule'
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt 'LookupCIEventsSQSQueue.Arn'
+          Id: LookupCIEventsSQSQueue
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 400
+  LookupCIEventsKMSCMK:
+    Type: AWS::KMS::Key
+    Properties:
+      PendingWindowInDays: 7
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow EventBridge to use the CMK for encryption
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs to use the CMK for encryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt*
+              - kms:Encrypt*
+              - kms:ReEncrypt*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/LookupCIEventsLambdaFunctionName'
+  LookupCIEventsSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !GetAtt 'LookupCIEventsKMSCMK.KeyId'
+      DelaySeconds: 600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt 'LookupCIEventsSQSQueueDLQ.Arn'
+        maxReceiveCount: 5
+  LookupCIEventsSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref 'LookupCIEventsSQSQueue'
+      PolicyDocument:
+        Statement:
+          - Action:
+              - SQS:SendMessage
+            Effect: Allow
+            Resource: !GetAtt 'LookupCIEventsSQSQueue.Arn'
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt 'LookupCIEventsCloudWatchEventRule.Arn'
+                  - !GetAtt 'LookupCIEventsCloudWatchEventRuleOversized.Arn'
+  LookupCIEventsSQSQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !GetAtt 'LookupCIEventsKMSCMK.KeyId'
+      DelaySeconds: 600
+  LookupCIEventsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !GetAtt 'LookupCIEventsKMSCMK.KeyId'
